@@ -27,7 +27,7 @@ Reclaimed 25.8 GB (measured free-space change; estimated 26.1 GB)
 
 ```sh
 pipx install .            # or: pip install -e .
-pipx install '.[llm]'     # optional: enables `janitor ask` and `janitor free --agent`
+pipx install '.[llm]'     # optional: adds the Anthropic SDK for Claude (other providers need nothing)
 ```
 
 Give your terminal **Full Disk Access** (System Settings → Privacy & Security) to let it
@@ -44,6 +44,7 @@ size `~/.Trash` and app containers; without it those locations are simply skippe
 | `janitor free 25GB [--agent]` | Scan → plan → approve → clean → measure |
 | `janitor du [PATH]` | Parallel "what is using space here" |
 | `janitor ask "why is my disk full?"` | Ask the LLM agent (optional) |
+| `janitor login [PROVIDER]` / `logout` / `models` / `use` | Connect and choose an LLM |
 | `janitor keep PATH` / `ignore PATH` / `forget PATH` | Remember decisions |
 | `janitor history` / `janitor undo ID` | Audit log; restore Trash moves |
 | `janitor schedule install --every 6h` | Background checks via launchd |
@@ -54,6 +55,7 @@ size `~/.Trash` and app containers; without it those locations are simply skippe
 CLI (argparse)            janitor scan · plan · clean · free · ask
    │
 Agent harness             planner.py (deterministic)  ·  agent.py (LLM, optional)
+   │                      llm/ — providers, logins, Anthropic/Responses/Chat adapters
    │                      policy.py — approves or rejects every action
    │
 Engine                    analyzer.py (scan + candidates) · executor.py (typed ops)
@@ -104,14 +106,49 @@ until the Trash is emptied.
 * `disk_samples` — free-space trend for `status` and the agent
 * `notes` — short durable notes the agent saves about your preferences
 
-### Optional LLM agent
+### Optional LLM agent — bring any provider
 
-`janitor ask` / `janitor free --agent` run a small tool-use loop with Claude
-(`claude-opus-5-5` by default, configurable in `config.json`) over five tools:
+`janitor ask` / `janitor free --agent` run a small tool-use loop over five tools:
 `storage_overview`, `list_candidates`, `inspect_candidate`, `propose_plan`, `remember`.
 `propose_plan` goes through the policy engine and only saves a plan; you still approve it
-with `janitor clean`. Requires `pip install '.[llm]'` and `ANTHROPIC_API_KEY`.
-Server-side refusal fallbacks are enabled (`fallbacks: "default"`).
+with `janitor clean`. The model never sees a shell.
+
+```sh
+janitor login                 # pick a provider interactively
+janitor login openai          # → "Sign in with ChatGPT" or paste an API key
+janitor login anthropic       # → paste an API key, or `ant auth login` (Claude Console)
+janitor login google          # → Gemini API key from AI Studio
+janitor login google-vertex   # → `gcloud auth application-default login`
+janitor login custom --base-url https://my-gateway/v1
+janitor login --list          # what is connected
+janitor models groq           # list a provider's models
+janitor use openrouter some/model-id   # set the default
+janitor ask --provider ollama --model llama3.2 "what is filling my disk?"
+```
+
+| Provider | How you connect |
+|---|---|
+| OpenAI | **Sign in with ChatGPT** (uses your Plus/Pro/Business plan, OpenAI's official agent OAuth flow) or `OPENAI_API_KEY` |
+| Anthropic (Claude) | API key, or **`ant auth login`** (Claude Console OAuth, picked up by the Anthropic SDK) |
+| Google Gemini | AI Studio key (`GEMINI_API_KEY`) |
+| Google Vertex AI | **gcloud login** (Application Default Credentials) + project/location |
+| OpenRouter, Groq, xAI, Mistral, DeepSeek, Cerebras, Together, Fireworks, Hugging Face, Moonshot | API key (or the provider's usual env var) |
+| Ollama, LM Studio | Local, no key |
+| Custom | Any OpenAI-compatible base URL + key |
+
+Credentials resolve as: stored login → provider env var → (Claude) the SDK's own chain.
+Logins live in `auth.json` next to the database, created with mode `0600`; ChatGPT tokens
+refresh automatically. `janitor logout PROVIDER` removes one.
+
+**Why no Claude Pro/Max or Gemini CLI subscription login?** Anthropic's and Google's terms
+allow those subscription OAuth tokens only in their own apps (Claude Code / claude.ai,
+Gemini CLI / Antigravity), and both have blocked accounts that used them in third-party
+tools. MacJanitor offers their official developer logins instead (`ant auth login`, gcloud).
+OpenAI explicitly supports ChatGPT sign-in for third-party agents, so that one is offered.
+
+Wire formats: Claude uses the official Anthropic SDK (`pip install '.[llm]'`); OpenAI uses
+the Responses API; everything else uses OpenAI-compatible Chat Completions over the
+standard library — no other dependencies.
 
 ## Rules shipped
 
@@ -127,7 +164,7 @@ Add a rule by appending one `Rule(...)` to `rules.py`.
 
 `janitor config` writes and prints `config.json`: project roots to search, staleness
 threshold, minimum candidate size, extra protected paths, unattended-clean threshold,
-LLM model and effort.
+LLM provider, model per provider, and effort.
 
 ## Development
 

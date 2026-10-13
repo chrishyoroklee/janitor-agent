@@ -40,7 +40,10 @@ class Config:
     auto_clean_below_bytes: int = 0
     # Extra never-touch paths (relative to home or absolute).
     protected: list[str] = field(default_factory=list)
-    llm_model: str = "claude-opus-5-5"
+    # Optional LLM planner: which provider to use, and the chosen model per provider
+    # (`janitor login`, `janitor use PROVIDER MODEL`).
+    llm_provider: str = "anthropic"
+    llm_models: dict[str, str] = field(default_factory=dict)
     llm_effort: str = "medium"
 
     @classmethod

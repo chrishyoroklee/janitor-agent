@@ -7,6 +7,7 @@
     janitor free 25GB              scan + plan + approve + clean + verify
     janitor du [PATH]              what is using space under PATH
     janitor ask "question"         ask the optional LLM agent
+    janitor login [PROVIDER]       connect an LLM (API key, ChatGPT, Claude, Gemini, local)
     janitor keep|ignore|forget P   remember decisions about a path
     janitor history | undo ID      audit log, restore Trash moves
     janitor schedule install       periodic background checks (launchd)
@@ -255,7 +256,7 @@ class App:
             from macjanitor.agent import Agent
 
             agent = Agent(self.mem, self.policy, self.config, self.home, scan_id=scan_id,
-                          max_risk=max_risk)
+                          max_risk=max_risk, provider=self.args.provider, model=self.args.model)
             res = agent.ask(f"I need to free {fmt_bytes(target)}. Propose the least disruptive plan.")
             print("\n" + res.text)
             if res.plan_id is None:
@@ -303,9 +304,11 @@ class App:
 
         scan_id, _ = self.latest()
         agent = Agent(self.mem, self.policy, self.config, self.home, scan_id=scan_id,
-                      max_risk=Risk.parse(self.args.max_risk))
+                      max_risk=Risk.parse(self.args.max_risk), provider=self.args.provider,
+                      model=self.args.model)
         res = agent.ask(" ".join(self.args.question))
         print(res.text)
+        print(c(f"\n— {agent.provider} · {res.model}", "2"))
         if res.plan_id:
             print(c(f"\nSaved plan #{res.plan_id}. Review and run: `janitor clean --plan {res.plan_id}`", "2"))
         return 0
@@ -398,6 +401,88 @@ class App:
                                          "low-risk cleanup is available: run `janitor free`.")
         return 0
 
+    # -- LLM providers -------------------------------------------------------
+    def cmd_login(self) -> int:
+        from macjanitor.llm import providers as P
+
+        if self.args.list or not self.args.provider:
+            print("Providers:")
+            for p in P.PROVIDERS.values():
+                st = P.status(p)
+                ways = ", ".join(P.LOGIN_LABELS[m].split(" (")[0] for m in p.logins)
+                print(f"  {p.id:<14}{p.name:<36}" + (c(f"✓ {st}", "32") if st else c(ways, "2")))
+            print(c("\n" + P.NOT_OFFERED, "2"))
+            if self.args.list or not sys.stdin.isatty():
+                return 0
+            ids = list(P.PROVIDERS)
+            raw = input("\nProvider to connect: ").strip()
+            if raw not in ids:
+                print("Cancelled.")
+                return 1
+            self.args.provider = raw
+        p = P.get(self.args.provider)
+        print(P.login(p, method=self.args.method, key=self.args.key, base_url=self.args.base_url))
+        if self.config.llm_provider != p.id and (self.args.default or not P.status(P.get(self.config.llm_provider))):
+            self.config.llm_provider = p.id
+        model = self.config.llm_models.get(p.id) or p.default_model
+        if not model and sys.stdin.isatty():
+            model = self._pick_model(p)
+        if model:
+            self.config.llm_models[p.id] = model
+        self.config.save()
+        print(f"Default LLM: {self.config.llm_provider} · "
+              f"{self.config.llm_models.get(self.config.llm_provider) or '(no model yet)'}")
+        return 0
+
+    def _pick_model(self, p) -> str | None:
+        from macjanitor.llm import providers as P
+        from macjanitor.llm.http import LLMError
+
+        try:
+            models = P.list_models(p)
+        except (LLMError, RuntimeError) as e:
+            print(c(f"Could not list models: {e}", "33"))
+            models = []
+        if models:
+            shown = models[:40]
+            for i, m in enumerate(shown, 1):
+                print(f"  {i:>2}. {m}")
+            if len(models) > len(shown):
+                print(c(f"  … {len(models) - len(shown)} more (`janitor models {p.id}`)", "2"))
+        raw = input("Model (number or id, Enter to skip): ").strip()
+        if raw.isdigit() and models and 1 <= int(raw) <= min(40, len(models)):
+            return models[int(raw) - 1]
+        return raw or None
+
+    def cmd_logout(self) -> int:
+        from macjanitor.llm import providers as P
+
+        ok = P.logout(P.get(self.args.provider))
+        print("Signed out." if ok else "No stored login for that provider.")
+        return 0 if ok else 1
+
+    def cmd_models(self) -> int:
+        from macjanitor.llm import providers as P
+
+        p = P.get(self.args.provider or self.config.llm_provider)
+        current = self.config.llm_models.get(p.id) or p.default_model
+        for m in P.list_models(p):
+            print(("* " if m == current else "  ") + m)
+        return 0
+
+    def cmd_use(self) -> int:
+        from macjanitor.llm import providers as P
+
+        p = P.get(self.args.provider)
+        self.config.llm_provider = p.id
+        if self.args.model:
+            self.config.llm_models[p.id] = self.args.model
+        self.config.save()
+        st = P.status(p)
+        print(f"Default LLM: {p.id} · {self.config.llm_models.get(p.id) or p.default_model or '(no model)'}"
+              + ("" if st else c(f"  (not connected: run `janitor login {p.id}`)", "33")))
+        return 0
+
     def cmd_config(self) -> int:
         path = self.config.save()
         print(path)
@@ -441,14 +526,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--agent", action="store_true", help="let the LLM prioritize the plan")
     s.add_argument("--no-tools", action="store_true")
+    s.add_argument("--provider", help="LLM provider for --agent (default from config)")
+    s.add_argument("--model")
 
     s = sub.add_parser("du", help="what is using space under a folder")
     s.add_argument("path", nargs="?")
     s.add_argument("--top", type=int, default=20)
 
-    s = sub.add_parser("ask", help="ask the LLM agent (needs macjanitor[llm])")
+    s = sub.add_parser("ask", help="ask the LLM agent")
     s.add_argument("question", nargs="+")
     s.add_argument("--max-risk", default="medium", choices=["low", "medium", "high"])
+    s.add_argument("--provider", help="LLM provider (default from config)")
+    s.add_argument("--model")
+
+    s = sub.add_parser("login", help="connect an LLM provider")
+    s.add_argument("provider", nargs="?")
+    s.add_argument("--method", choices=["api_key", "chatgpt", "ant", "adc", "none"])
+    s.add_argument("--key", help="API key (prefer the hidden prompt or stdin)")
+    s.add_argument("--base-url", help="for custom / self-hosted endpoints")
+    s.add_argument("--default", action="store_true", help="make this the default provider")
+    s.add_argument("--list", action="store_true", help="list providers and their status")
+    s = sub.add_parser("logout", help="remove a stored LLM login")
+    s.add_argument("provider")
+    s = sub.add_parser("models", help="list models a provider offers")
+    s.add_argument("provider", nargs="?")
+    s = sub.add_parser("use", help="set the default LLM provider and model")
+    s.add_argument("provider")
+    s.add_argument("model", nargs="?")
 
     for name, hlp in (("keep", "never touch this path"), ("ignore", "leave out of plans")):
         s = sub.add_parser(name, help=hlp)

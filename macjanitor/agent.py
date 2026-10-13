@@ -1,4 +1,4 @@
-"""Optional LLM planner (Claude via the Anthropic SDK).
+"""Optional LLM planner, over any provider in `macjanitor.llm`.
 
 The model gets five read-mostly tools over the engine's own data. It can
 explain, prioritize and *propose* a plan of candidate ids; it cannot name a
@@ -6,7 +6,8 @@ path, a command or an action. Proposals go through the same policy engine as
 deterministic plans, are saved as a plan, and still need the user's approval
 in `janitor clean`.
 
-Install with:  pip install 'macjanitor[llm]'   and set ANTHROPIC_API_KEY.
+Connect a provider with `janitor login` (API key, Sign in with ChatGPT,
+`ant auth login`, gcloud, or a local Ollama / LM Studio server).
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from macjanitor.analyzer import Candidate
 from macjanitor.config import Config
 from macjanitor.db import Memory
 from macjanitor.fsutil import disk_usage, fmt_bytes
+from macjanitor.llm.chat import open_chat
+from macjanitor.llm.http import LLMError
 from macjanitor.planner import validate_selection
 from macjanitor.policy import Policy
 from macjanitor.rules import Risk
@@ -50,12 +53,12 @@ TOOLS = [
         "name": "storage_overview",
         "description": "Disk capacity, free space, free-space trend, and reclaimable bytes per "
                        "category and rule from the latest scan.",
-        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "list_candidates",
         "description": "List cleanup candidates from the latest scan, largest first.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "max_risk": {"type": "string", "enum": ["low", "medium", "high"]},
@@ -69,7 +72,7 @@ TOOLS = [
         "name": "inspect_candidate",
         "description": "Full detail for one candidate: rule explanation, size history across "
                        "scans, and whether policy currently allows acting on it.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"id": {"type": "string"}},
             "required": ["id"],
@@ -80,7 +83,7 @@ TOOLS = [
         "name": "propose_plan",
         "description": "Save a cleanup plan of candidate ids, in execution order, for the user to "
                        "review. Returns which items policy accepted or rejected and the plan id.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
@@ -94,7 +97,7 @@ TOOLS = [
         "name": "remember",
         "description": "Store a short durable note about the user's preferences or machine for "
                        "future sessions.",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"note": {"type": "string", "maxLength": 300}},
             "required": ["note"],
@@ -108,19 +111,17 @@ TOOLS = [
 class AgentResult:
     text: str
     plan_id: int | None = None
+    model: str = ""
 
 
 class Agent:
     def __init__(self, mem: Memory, policy: Policy, config: Config, home: str, *,
-                 scan_id: int, max_risk: Risk = Risk.MEDIUM):
-        try:
-            import anthropic
-        except ImportError as e:  # pragma: no cover - depends on the environment
-            raise RuntimeError("the LLM planner needs: pip install 'macjanitor[llm]'") from e
-        self.anthropic = anthropic
-        self.client = anthropic.Anthropic()
+                 scan_id: int, max_risk: Risk = Risk.MEDIUM, provider: str | None = None,
+                 model: str | None = None):
         self.mem, self.policy, self.config, self.home = mem, policy, config, home
         self.scan_id, self.max_risk = scan_id, max_risk
+        self.provider = provider or config.llm_provider
+        self.model = model or config.llm_models.get(self.provider)
         self.cands = {r["cid"]: Candidate.from_row(r) for r in mem.candidates(scan_id)}
         self.plan_id: int | None = None
 
@@ -185,43 +186,24 @@ class Agent:
                f"Highest risk the user allowed this session: {self.max_risk}."
 
     def ask(self, question: str) -> AgentResult:
-        a = self.anthropic
-        messages: list = [{"role": "user", "content": question}]
-        for _ in range(MAX_TURNS):
-            try:
-                resp = self.client.beta.messages.create(
-                    model=self.config.llm_model,
-                    max_tokens=16000,
-                    system=self._system(),
-                    tools=TOOLS,
-                    messages=messages,
-                    output_config={"effort": self.config.llm_effort},
-                    betas=["server-side-fallback-2026-07-01"],
-                    fallbacks="default",
-                )
-            except a.AuthenticationError:
-                raise RuntimeError("Anthropic authentication failed; set ANTHROPIC_API_KEY")
-            except a.RateLimitError:
-                raise RuntimeError("rate limited by the Anthropic API; try again shortly")
-            except a.APIStatusError as e:
-                raise RuntimeError(f"Anthropic API error {e.status_code}: {e.message}")
-            except a.APIConnectionError:
-                raise RuntimeError("could not reach the Anthropic API")
-
-            if resp.stop_reason == "refusal":
-                return AgentResult("The model declined this request.", self.plan_id)
-            messages.append({"role": "assistant", "content": resp.content})
-            calls = [b for b in resp.content if b.type == "tool_use"]
-            if resp.stop_reason != "tool_use" or not calls:
-                text = "".join(b.text for b in resp.content if b.type == "text").strip()
-                return AgentResult(text or "(no answer)", self.plan_id)
-            results = []
-            for b in calls:
-                try:
-                    out, err = self._tool(b.name, dict(b.input)), False
-                except (KeyError, ValueError, TypeError) as e:
-                    out, err = {"error": str(e)}, True
-                results.append({"type": "tool_result", "tool_use_id": b.id,
-                                "content": json.dumps(out), "is_error": err})
-            messages.append({"role": "user", "content": results})
-        return AgentResult("Stopped after too many steps.", self.plan_id)
+        try:
+            chat, model = open_chat(self.provider, self.model, self._system(), TOOLS,
+                                    self.config.llm_effort)
+            chat.user(question)
+            for _ in range(MAX_TURNS):
+                turn = chat.step()
+                if turn.refused:
+                    return AgentResult("The model declined this request.", self.plan_id, model)
+                if not turn.calls:
+                    return AgentResult(turn.text or "(no answer)", self.plan_id, model)
+                results = []
+                for call in turn.calls:
+                    try:
+                        out, err = self._tool(call.name, call.args), False
+                    except (KeyError, ValueError, TypeError) as e:
+                        out, err = {"error": str(e)}, True
+                    results.append((call.id, json.dumps(out), err))
+                chat.tool_results(results)
+            return AgentResult("Stopped after too many steps.", self.plan_id, model)
+        except LLMError as e:
+            raise RuntimeError(str(e)) from None
