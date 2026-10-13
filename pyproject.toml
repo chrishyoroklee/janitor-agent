@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macjanitor"
+version = "0.1.0"
+description = "A fast, safe, local-first storage maintenance agent for macOS"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+dependencies = []  # the engine is stdlib-only
+
+[project.optional-dependencies]
+llm = ["anthropic>=1.13"]
+
+[project.scripts]
+janitor = "macjanitor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["macjanitor*"]
