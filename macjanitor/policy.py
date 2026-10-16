@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass, field
 
 from macjanitor import rules
-from macjanitor.fsutil import is_within
+from macjanitor.fsutil import canonical, is_within
 from macjanitor.rules import Risk
 
 # Never touched, by any rule, for any reason (home-relative).
@@ -47,7 +47,8 @@ class Policy:
         self.home = os.path.realpath(home)
         self.decisions = decisions or {}
         self.protected = [os.path.join(self.home, p) for p in PROTECTED]
-        self.protected += [p if os.path.isabs(p) else os.path.join(self.home, p) for p in extra_protected]
+        self.protected += [canonical(p if os.path.isabs(p) else os.path.join(self.home, p))
+                           for p in extra_protected]
         self.personal = [os.path.join(self.home, p) for p in PERSONAL]
 
     def check(self, cand, *, max_risk: Risk = Risk.HIGH, unattended: bool = False,
@@ -75,7 +76,8 @@ class Policy:
             return v.deny("path is not absolute and normalized")
         if not is_within(path, self.home) or path == self.home:
             return v.deny("path is outside the home directory")
-        if os.path.dirname(path) == self.home:
+        if os.path.dirname(path) == self.home and os.path.basename(path) not in rule.paths:
+            # Only a rule that names the folder literally (e.g. ".Trash") may act on it.
             return v.deny("refusing to act on a top-level home folder")
         for p in self.protected:
             if is_within(path, p) or is_within(p, path):

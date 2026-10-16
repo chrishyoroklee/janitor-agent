@@ -209,8 +209,10 @@ def login(p: Provider, *, method: str | None = None, key: str | None = None,
           base_url: str | None = None) -> str:
     """Run the interactive login for `p`. Returns a one-line summary."""
     methods = list(p.logins)
+    if method is None and key and API_KEY in methods:
+        method = API_KEY
     if method is None:
-        method = methods[0] if len(methods) == 1 or key else methods[_choose(
+        method = methods[0] if len(methods) == 1 else methods[_choose(
             f"How do you want to connect {p.name}?", [LOGIN_LABELS[m] for m in methods])]
     if method not in methods:
         raise LLMError(f"{p.name} supports: {', '.join(methods)}")

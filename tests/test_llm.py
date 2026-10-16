@@ -87,6 +87,13 @@ class StoreAndResolveTests(Base):
             self.assertIn("verified", providers.login(p, key="good-key"))
         self.assertEqual(store.get("mistral")["key"], "good-key")
 
+    def test_key_flag_selects_api_key_login(self):
+        # OpenAI lists ChatGPT sign-in first; passing --key must not open the browser.
+        with mock.patch.object(chatgpt_oauth, "login", side_effect=AssertionError("browser")), \
+                mock.patch.object(providers, "list_models", return_value=["m"]):
+            providers.login(providers.get("openai"), key="sk-test")
+        self.assertEqual(store.get("openai"), {"type": "api_key", "key": "sk-test"})
+
 
 class ChatGPTOAuthTests(Base):
     def test_callback_validation(self):
