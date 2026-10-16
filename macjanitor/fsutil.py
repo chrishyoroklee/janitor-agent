@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from dataclasses import dataclass
 
 _UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
@@ -51,8 +52,9 @@ def du(root: str, *, one_filesystem: bool = True) -> Usage:
         u.errors += 1
         return u
     if not stat.S_ISDIR(st.st_mode):
-        _count_file(u, st, {})
-        _settle_links(u, {})
+        links: dict = {}
+        _count_file(u, st, links)
+        _settle_links(u, links)
         return u
 
     dev = st.st_dev
@@ -142,6 +144,32 @@ def parse_size(text: str) -> int:
     if binary:
         return int(num * 1024 ** "bkmgtp".index(unit or "b"))
     return int(num * _MULT[unit])
+
+
+def canonical(path: str) -> str:
+    """realpath, plus the on-disk spelling of every component.
+
+    macOS volumes are usually case-insensitive and realpath keeps whatever case
+    it was given, so `~/code` and `~/Code` would otherwise look like different
+    folders. F_GETPATH asks the kernel for the path as stored. Paths that do
+    not exist (yet) keep their realpath spelling.
+    """
+    path = os.path.realpath(path)
+    if sys.platform != "darwin":
+        return path
+    import fcntl
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return path
+    try:
+        buf = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+    except OSError:
+        return path
+    finally:
+        os.close(fd)
+    return os.fsdecode(buf.split(b"\0", 1)[0]) or path
 
 
 def is_within(path: str, root: str) -> bool:

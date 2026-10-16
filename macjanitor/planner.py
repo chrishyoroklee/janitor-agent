@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from macjanitor.analyzer import Candidate
+from macjanitor.fsutil import is_within
 from macjanitor.policy import Policy, Verdict
 from macjanitor.rules import Risk
 
@@ -34,12 +35,11 @@ class Plan:
 def make_plan(cands: list[Candidate], policy: Policy, *, target: int | None = None,
               max_risk: Risk = Risk.MEDIUM, decisions: dict | None = None,
               unattended: bool = False) -> Plan:
-    decisions = decisions or {}
+    ignored = [p for p, d in (decisions or {}).items() if d["verdict"] == "ignore"]
     plan = Plan(target=target)
     eligible: list[Candidate] = []
     for c in cands:
-        d = decisions.get(c.path)
-        if d is not None and d["verdict"] == "ignore":
+        if any(is_within(c.path, p) for p in ignored):
             continue
         v = policy.check(c, max_risk=max_risk, unattended=unattended)
         (eligible.append(c) if v.allowed else plan.rejected.append((c, v)))

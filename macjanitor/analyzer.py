@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 from macjanitor import rules
 from macjanitor.config import Config
-from macjanitor.fsutil import Usage, du
+from macjanitor.fsutil import Usage, canonical, du, is_within
 from macjanitor.rules import Risk, Rule
 
 DAY = 86400
@@ -103,12 +103,12 @@ class Analyzer:
         """Walk project roots for node_modules, virtualenvs and CACHEDIR.TAG dirs."""
         node, venv, cache = rules.get("node-modules"), rules.get("python-venv"), rules.get("build-cache-dir")
         found: list[tuple[Rule, str, str]] = []
-        seen_roots: set[str] = set()
-        for rel in self.config.project_roots:
-            root = os.path.realpath(os.path.join(self.home, rel))
-            if not os.path.isdir(root) or any(root.startswith(s + os.sep) or root == s for s in seen_roots):
-                continue
-            seen_roots.add(root)
+        # Canonical spelling so `code` and `Code` (one folder on APFS) count once,
+        # and drop roots nested in another root whatever order they are listed in.
+        roots = {canonical(os.path.join(self.home, rel)) for rel in self.config.project_roots}
+        roots = {r for r in roots if os.path.isdir(r)}
+        roots = sorted(r for r in roots if not any(o != r and is_within(r, o) for o in roots))
+        for root in roots:
             stack = [(root, 0)]
             while stack:
                 path, depth = stack.pop()

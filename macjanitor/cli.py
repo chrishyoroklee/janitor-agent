@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +28,7 @@ from macjanitor.analyzer import Analyzer, Candidate
 from macjanitor.config import Config, user_home
 from macjanitor.db import Memory
 from macjanitor.executor import Executor, Result
-from macjanitor.fsutil import disk_usage, du, fmt_bytes, parse_size
+from macjanitor.fsutil import canonical, disk_usage, du, fmt_bytes, parse_size
 from macjanitor.planner import Plan, make_plan
 from macjanitor.policy import Policy
 from macjanitor.rules import Risk
@@ -84,7 +85,8 @@ class App:
         decisions = self.mem.decisions()
         print(f"{'ID':<11}{'SIZE':>10}  {'RISK':<7}{'WHAT':<34}PATH")
         for cand in cands[:limit]:
-            mark = c(" (ignored)", "2") if decisions.get(cand.path) else ""
+            d = decisions.get(cand.path)
+            mark = c(f" ({d['verdict']})", "2") if d else ""
             print(f"{cand.cid:<11}{fmt_bytes(cand.reclaimable):>10}  {risk_label(cand.risk)} "
                   f"{rules.get(cand.rule_id).title[:33]:<34}{short(cand.path, self.home)}{mark}")
         if len(cands) > limit:
@@ -131,7 +133,10 @@ class App:
         if low:
             size = fmt_bytes(sum(x.reclaimable for x in low))
             if dry_run or assume_yes or (interactive and _confirm(f"Run {len(low)} low-risk action(s), ~{size}?")):
-                approved += [(x, "flag" if assume_yes else "user") for x in low]
+                approved += [(x, "dry_run" if dry_run else "flag" if assume_yes else "user") for x in low]
+            elif not interactive:
+                print(c(f"skipped {len(low)} low-risk action(s), ~{size} (needs approval: "
+                        "run interactively or pass --yes)", "2"))
         for x in items:
             if x.risk == Risk.LOW:
                 continue
@@ -196,7 +201,7 @@ class App:
 
     def cmd_plan(self) -> int:
         scan_id, cands = self.latest()
-        target = parse_size(self.args.target) if self.args.target else None
+        target = self.args.target
         max_risk = Risk.parse(self.args.max_risk)
         plan = make_plan(cands, self.policy, target=target, max_risk=max_risk,
                          decisions=self.mem.decisions())
@@ -249,7 +254,7 @@ class App:
             print(c(f"Short of the {fmt_bytes(target)} target by {fmt_bytes(target - freed)}.", "33"))
 
     def cmd_free(self) -> int:
-        target = parse_size(self.args.amount)
+        target = self.args.amount
         max_risk = Risk.parse(self.args.max_risk)
         scan_id, cands = self.scan()
         if self.args.agent:
@@ -314,7 +319,7 @@ class App:
         return 0
 
     def _resolve(self, p: str) -> str:
-        return os.path.realpath(os.path.expanduser(p))
+        return canonical(os.path.expanduser(p))
 
     def cmd_keep(self) -> int:
         path = self._resolve(self.args.path)
@@ -363,9 +368,7 @@ class App:
 
     def cmd_schedule(self) -> int:
         if self.args.op == "install":
-            every = self.args.every.strip().lower()
-            unit = {"h": 3600, "m": 60}.get(every[-1:], 1)
-            seconds = max(900, int(float(every.rstrip("hm")) * unit))
+            seconds = max(900, self.args.every)
             path = launchd.install(seconds)
             print(f"Installed {path} (every {seconds / 3600:g}h).")
             if self.config.auto_clean_below_bytes:
@@ -497,6 +500,32 @@ def _confirm(prompt: str) -> bool:
         return False
 
 
+def _size_arg(text: str) -> int:
+    try:
+        return parse_size(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a size: {text!r} (try 20GB or 500MB)") from None
+
+
+_INTERVAL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.I)
+
+
+def parse_interval(text: str) -> int:
+    """'6h', '45m', '1d', '3600' (seconds) -> seconds."""
+    m = _INTERVAL_RE.match(text)
+    if not m:
+        raise ValueError(f"not an interval: {text!r}")
+    unit = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2).lower()]
+    return int(float(m.group(1)) * unit)
+
+
+def _interval_arg(text: str) -> int:
+    try:
+        return parse_interval(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{e} (try 6h, 45m or 1d)") from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="janitor", description="Safe, fast storage maintenance for macOS.")
     p.add_argument("--version", action="version", version=f"macjanitor {__version__}")
@@ -509,7 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-tools", action="store_true", help="skip docker/simctl probes")
 
     s = sub.add_parser("plan", help="build a dry-run plan")
-    s.add_argument("--target", help="amount to free, e.g. 20GB")
+    s.add_argument("--target", type=_size_arg, help="amount to free, e.g. 20GB")
     s.add_argument("--max-risk", default="medium", choices=["low", "medium", "high"])
     s.add_argument("-v", "--verbose", action="store_true", help="show items excluded by policy")
 
@@ -520,7 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
 
     s = sub.add_parser("free", help="scan, plan, approve, clean and verify")
-    s.add_argument("amount", help="e.g. 25GB")
+    s.add_argument("amount", type=_size_arg, help="e.g. 25GB")
     s.add_argument("--max-risk", default="medium", choices=["low", "medium", "high"])
     s.add_argument("-y", "--yes", action="store_true", help="approve low/medium items (never high)")
     s.add_argument("--dry-run", action="store_true")
@@ -569,7 +598,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("schedule", help="periodic background checks via launchd")
     s.add_argument("op", choices=["install", "uninstall"])
-    s.add_argument("--every", default="6h", help="interval, e.g. 6h or seconds")
+    s.add_argument("--every", type=_interval_arg, default="6h", help="interval, e.g. 6h, 1d or seconds")
     sub.add_parser("auto")  # launchd entry point
     sub.add_parser("config", help="write and show the config file")
     return p

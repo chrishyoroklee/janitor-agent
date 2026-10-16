@@ -38,6 +38,10 @@ def age(path: Path, mtime: float = OLD) -> None:
     os.utime(path, (mtime, mtime))
 
 
+def case_insensitive(path: str) -> bool:
+    return os.path.exists(path.swapcase())
+
+
 class Env(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -114,6 +118,12 @@ class FsutilTests(unittest.TestCase):
             self.assertLess(u.reclaimable, 2 * MB)
             self.assertGreaterEqual(u.reclaimable, 1 * MB)
 
+    def test_single_hardlinked_file_is_not_reclaimable(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = write(Path(d, "a.dmg"), 2 * MB)
+            os.link(f, Path(d, "elsewhere.dmg"))
+            self.assertEqual(du(str(f)).reclaimable, 0)
+
     def test_does_not_follow_symlinks(self):
         with tempfile.TemporaryDirectory() as d:
             write(Path(d, "big/file"), 3 * MB)
@@ -146,6 +156,17 @@ class AnalyzerTests(Env):
         h = self.mem.history(str(self.h / "Library/Developer/Xcode/DerivedData"))
         self.assertEqual(h["times_seen"], 2)
         self.assertGreater(h["last_size"], h["prev_size"])
+
+    def test_overlapping_project_roots_scanned_once(self):
+        self.build_home()
+        roots = ["code/old", "code"]  # child listed before its parent
+        if case_insensitive(self.home):
+            roots.append("CODE")      # same folder, different spelling
+        self.config.project_roots = roots
+        cands, _ = self.scan()
+        nm = [c for c in cands if c.rule_id == "node-modules"]
+        self.assertEqual([os.path.relpath(c.path, self.home) for c in nm], ["code/old/node_modules"])
+        self.mem.record_scan(time.time(), 1, 1, cands)  # no duplicate-key crash
 
 
 class PolicyTests(Env):
@@ -211,6 +232,22 @@ class PolicyTests(Env):
         c = self.cand("node-modules", "code/proj/node_modules")
         self.assertIn("git", " ".join(self.policy().check(c).reasons))
 
+    def test_trash_rule_is_usable(self):
+        write(self.h / ".Trash/old.zip", 2 * MB)
+        _, by = Env.scan(self)
+        v = self.policy().check(by["trash:.Trash"])
+        self.assertTrue(v.allowed, v.reasons)
+
+    def test_keep_spelled_with_other_case_is_honored(self):
+        self.build_home()
+        if not case_insensitive(self.home):
+            self.skipTest("case-sensitive filesystem")
+        from macjanitor.cli import main
+        with redirect_stdout(io.StringIO()):
+            main(["keep", str(self.h / "CODE/OLD")])
+        c = self.cand("node-modules", "code/old/node_modules")
+        self.assertIn("keep", " ".join(self.policy().check(c).reasons))
+
 
 class PlannerTests(Env):
     def test_low_risk_first_and_stops_at_target(self):
@@ -236,6 +273,13 @@ class PlannerTests(Env):
                                   self.policy(), max_risk=Risk.MEDIUM)
         self.assertEqual([c.cid for c in plan.items], [pip.cid])
         self.assertEqual(len(plan.rejected), 1)
+
+    def test_ignore_covers_everything_inside(self):
+        self.build_home()
+        cands, _ = self.scan()
+        self.mem.decide(str(self.h / "code/old"), "ignore")
+        plan = make_plan(cands, self.policy(), max_risk=Risk.MEDIUM, decisions=self.mem.decisions())
+        self.assertNotIn("node-modules", [c.rule_id for c in plan.items])
 
 
 class ExecutorTests(Env):
@@ -331,6 +375,26 @@ class CliTests(Env):
             code, out = self.run_cli("clean", "--yes")
         self.assertTrue((self.h / "Downloads/tool.dmg").exists())
         self.assertIn("needs interactive approval", out)
+
+    def test_non_interactive_low_risk_explains_skip(self):
+        self.build_home()
+        with mock.patch.object(Config, "load", return_value=self.config):
+            code, out = self.run_cli("free", "5MB", "--no-tools")
+        self.assertIn("needs approval", out)
+
+    def test_bad_size_is_a_usage_error(self):
+        from macjanitor.cli import build_parser
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            build_parser().parse_args(["free", "lots"])
+
+    def test_schedule_interval_parsing(self):
+        from macjanitor.cli import parse_interval
+        self.assertEqual(parse_interval("6h"), 6 * 3600)
+        self.assertEqual(parse_interval("1d"), 86400)
+        self.assertEqual(parse_interval("45m"), 2700)
+        self.assertEqual(parse_interval("3600"), 3600)
+        with self.assertRaises(ValueError):
+            parse_interval("often")
 
 
 if __name__ == "__main__":
